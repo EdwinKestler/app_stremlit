@@ -6,8 +6,7 @@ from shapely.geometry import shape
 from datetime import datetime
 from samgeo import SamGeo, tms_to_geotiff
 from samgeo.text_sam import LangSAM
-import folium
-from folium import FeatureGroup, LayerControl, GeoJson
+import leafmap
 import torch
 from rasterio.features import shapes
 
@@ -21,12 +20,10 @@ timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 MIN_AREA = 10  # Minimum polygon area to be considered valid
 
 def setup_directories():
-    """Create output and checkpoint directories if they don't exist."""
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
 def download_tms_image(bbox, zoom):
-    """Download TMS image and save it to the output directory."""
     image_path = os.path.join(output_dir, f"esri_image_{timestamp}.tif")
     try:
         tms_to_geotiff(output=image_path, bbox=bbox, zoom=zoom, source="Satellite", overwrite=True)
@@ -39,7 +36,9 @@ def download_tms_image(bbox, zoom):
         raise
 
 def process_text_segmentation(text_prompts, image_path, profile):
-    """Generate individual masks for each text prompt using LangSAM and save as GeoPackage and Shapefile layers."""
+    lang_checkpoint = os.path.join(checkpoint_dir, "mobile_sam.pt")
+    if not os.path.exists(lang_checkpoint):
+        print("⚠️ Checkpoint de LangSAM no encontrado. Por favor descargalo manualmente o implementa la función de descarga automática.")
     lang_sam = LangSAM()
     prompt_outputs = {}
 
@@ -80,10 +79,9 @@ def process_text_segmentation(text_prompts, image_path, profile):
     return prompt_outputs
 
 def run_sam_segmentation(image_path):
-    """Run automatic SAM segmentation on the input image."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     checkpoint_path = os.path.join(checkpoint_dir, "sam_vit_h_4b8939.pth")
-    
+
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"SAM checkpoint not found at {checkpoint_path}. Please download it.")
 
@@ -97,8 +95,15 @@ def run_sam_segmentation(image_path):
         print(f"❌ Error en segmentación SAM: {e}")
         raise
 
+def subtract_langsam_from_sam(sam_gdf, prompt_outputs):
+    for prompt, vector_out in prompt_outputs.items():
+        gdf = gpd.read_file(vector_out).to_crs(sam_gdf.crs)
+        combined = gdf.unary_union
+        sam_gdf["geometry"] = sam_gdf.geometry.difference(combined)
+    sam_gdf = sam_gdf[sam_gdf.geometry.is_valid & ~sam_gdf.geometry.is_empty]
+    return sam_gdf
+
 def save_sam_segments(filtered_mask_path):
-    """Save SAM segments as GeoPackage and Shapefile layers."""
     try:
         with rasterio.open(filtered_mask_path) as mask_src:
             mask_data = mask_src.read(1)
@@ -125,150 +130,116 @@ def save_sam_segments(filtered_mask_path):
         raise
 
 def create_interactive_map(bbox, zoom, prompt_outputs, sam_vector_out):
-    """Create an interactive map using Folium with clear, toggleable layers, labels, and a legend."""
-    # Define distinct styles with better contrast and lower opacity
     layer_styles = {
-        "tree": {"color": "#00CC00", "weight": 2, "fillColor": "#00FF00", "fillOpacity": 0.2},  # Bright green for trees
-        "water": {"color": "#3399FF", "weight": 2, "fillColor": "#66B2FF", "fillOpacity": 0.2},  # Light blue for water
-        "building": {"color": "#800080", "weight": 2, "fillColor": "#CC00CC", "fillOpacity": 0.2},  # Purple for buildings
-        "road": {"color": "#808080", "weight": 2, "fillColor": "#A9A9A9", "fillOpacity": 0.2},  # Gray for roads
-        "SAM_segment": {"color": "#FF6600", "weight": 2, "fillColor": "#FF9933", "fillOpacity": 0.2},  # Bright orange for SAM
+        "tree": {"color": "#00CC00", "weight": 2, "fillColor": "#00FF00", "fillOpacity": 0.2},
+        "water": {"color": "#3399FF", "weight": 2, "fillColor": "#66B2FF", "fillOpacity": 0.2},
+        "building": {"color": "#8B4513", "weight": 2, "fillColor": "#CD853F", "fillOpacity": 0.3},
+        "road": {"color": "#555555", "weight": 2, "fillColor": "#AAAAAA", "fillOpacity": 0.3},
+        "SAM_segment": {"color": "#FF6600", "weight": 2, "fillColor": "#FF9933", "fillOpacity": 0.2}
     }
 
-    # Calculate center and adjust zoom to fit the bounding box
     center = [(bbox[1] + bbox[3]) / 2, (bbox[0] + bbox[2]) / 2]
     adjusted_zoom = zoom - 1
-
     html_path = os.path.join(output_dir, f"segmentacion_mapa_{timestamp}.html")
     try:
-        # Create a Folium map
-        m = folium.Map(location=center, zoom_start=adjusted_zoom, tiles=None)
+        m = leafmap.Map(center=center, zoom=adjusted_zoom, scroll_wheel_zoom=True)
+        m.add_basemap("Esri.WorldImagery")
 
-        # Add Esri World Imagery as the basemap
-        folium.TileLayer(
-            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-            attr='Esri',
-            name='Esri World Imagery',
-            overlay=False,
-            control=True
-        ).add_to(m)
-
-        # Add scale bar if folium.plugins is available
-        try:
-            folium.plugins.ScaleControl(position="bottomleft").add_to(m)
-        except AttributeError:
-            print("⚠️ 'folium.plugins' no está disponible. Por favor, actualiza folium con 'pip install --upgrade folium'. El mapa se generará sin barra de escala.")
-
-        # Create feature groups for text-based segmentations and SAM segments
-        text_group = FeatureGroup(name="Text Segmentations", show=True)
-        sam_group = FeatureGroup(name="SAM Segmentations", show=True)
-
-        # Add text-based segmentations (e.g., tree, water, building, road)
         for prompt, vector_out in prompt_outputs.items():
-            gdf = gpd.read_file(vector_out)
-            gdf = gdf.to_crs(epsg=4326)  # Ensure the GeoDataFrame is in WGS84 for Folium
-            geojson_data = gdf.__geo_interface__
+            m.add_vector(
+                vector_out,
+                layer_name=f"{prompt.capitalize()} Segmentation",
+                style=layer_styles[prompt],
+                group="Text Segmentations"
+            )
 
-            GeoJson(
-                geojson_data,
-                name=f"{prompt.capitalize()} Segmentation",
-                style_function=lambda feature, p=prompt: {
-                    "color": layer_styles[p]["color"],
-                    "weight": layer_styles[p]["weight"],
-                    "fillColor": layer_styles[p]["fillColor"],
-                    "fillOpacity": layer_styles[p]["fillOpacity"]
-                },
-                popup=folium.GeoJsonPopup(fields=["label"]),
-            ).add_to(text_group)
+        m.add_vector(
+            sam_vector_out,
+            layer_name="SAM Segments",
+            style=layer_styles["SAM_segment"],
+            group="SAM Segmentations"
+        )
 
-        # Add SAM segments
-        sam_gdf = gpd.read_file(sam_vector_out)
-        sam_gdf = sam_gdf.to_crs(epsg=4326)  # Ensure WGS84 for Folium
-        sam_geojson_data = sam_gdf.__geo_interface__
+        m.add_layer_control(position="topright")
+        legend_dict = {
+            "Trees (Green)": "#00FF00",
+            "Water (Blue)": "#66B2FF",
+            "Buildings (Brown)": "#CD853F",
+            "Roads (Gray)": "#AAAAAA",
+            "SAM Segments (Orange)": "#FF9933"
+        }
+        m.add_legend(title="Segmentation Layers", legend_dict=legend_dict, position="bottomright")
+        m.to_html(outfile=html_path)
 
-        GeoJson(
-            sam_geojson_data,
-            name="SAM Segments",
-            style_function=lambda feature: {
-                "color": layer_styles["SAM_segment"]["color"],
-                "weight": layer_styles["SAM_segment"]["weight"],
-                "fillColor": layer_styles["SAM_segment"]["fillColor"],
-                "fillOpacity": layer_styles["SAM_segment"]["fillOpacity"]
-            },
-            popup=folium.GeoJsonPopup(fields=["label"]),
-        ).add_to(sam_group)
-
-        # Add the feature groups to the map
-        text_group.add_to(m)
-        sam_group.add_to(m)
-
-        # Add layer control (collapsible)
-        LayerControl(position="topright", collapsed=True).add_to(m)
-
-        # Add a custom legend using HTML
-        legend_html = '''
-        <div style="position: fixed; bottom: 50px; right: 50px; z-index: 1000; background-color: white; padding: 10px; border: 2px solid grey; border-radius: 5px;">
-            <b>Segmentation Layers</b><br>
-            <i style="background: #00FF00; width: 18px; height: 18px; display: inline-block; vertical-align: middle;"></i> Trees (Green)<br>
-            <i style="background: #66B2FF; width: 18px; height: 18px; display: inline-block; vertical-align: middle;"></i> Water (Blue)<br>
-            <i style="background: #CC00CC; width: 18px; height: 18px; display: inline-block; vertical-align: middle;"></i> Buildings (Purple)<br>
-            <i style="background: #A9A9A9; width: 18px; height: 18px; display: inline-block; vertical-align: middle;"></i> Roads (Gray)<br>
-            <i style="background: #FF9933; width: 18px; height: 18px; display: inline-block; vertical-align: middle;"></i> SAM Segments (Orange)
-        </div>
-        '''
-        m.get_root().html.add_child(folium.Element(legend_html))
-
-        # Save the map to HTML
-        m.save(html_path)
         print(f"📁 Mapa HTML exportado: {html_path}")
-        print("ℹ️ Usa los controles de capas para activar/desactivar las capas.")
         return m
     except Exception as e:
         print(f"❌ Error al crear el mapa interactivo: {e}")
         raise
 
+def calculate_class_coverage(prompt_outputs, sam_vector_out):
+    import pandas as pd
+    print("📊 Calculando cobertura por clase...")
+    total_area = 0.0
+    class_areas = {}
+
+    # Sumar áreas de cada clase LangSAM
+    for prompt, vector_out in prompt_outputs.items():
+        gdf = gpd.read_file(vector_out)
+        area = gdf.geometry.area.sum()
+        class_areas[prompt] = area
+        total_area += area
+
+    # Agregar SAM_segment
+    gdf_sam = gpd.read_file(sam_vector_out)
+    sam_area = gdf_sam.geometry.area.sum()
+    class_areas["SAM_segment"] = sam_area
+    total_area += sam_area
+
+    # Mostrar porcentajes
+    coverage_data = []
+    for cls, area in class_areas.items():
+        pct = (area / total_area) * 100 if total_area > 0 else 0
+        coverage_data.append({"class": cls, "area": area, "percentage": pct})
+        print(f"   🔹 {cls.capitalize()}: {pct:.2f}% cobertura")
+
+    # Save CSV
+    df = pd.DataFrame(coverage_data)
+    csv_path = os.path.join(output_dir, f"coverage_summary_{timestamp}.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"📄 Cobertura exportada a CSV: {csv_path}")
+
+    # Floating div to inject in HTML map
+    coverage_colors = {
+        "tree": "#00FF00",
+        "water": "#66B2FF",
+        "building": "#CD853F",
+        "road": "#AAAAAA",
+        "SAM_segment": "#FF9933"
+    }
+    coverage_html = """<div style='position: fixed; bottom: 20px; left: 20px; background-color: white; border: 1px solid #aaa; padding: 10px; z-index: 1000;'>
+    <b>Resumen de Cobertura:</b><br>
+    """ + "".join([
+        f"<i style='background:{coverage_colors.get(row['class'], '#000')}; width: 12px; height: 12px; display: inline-block; margin-right: 5px;'></i>{row['class'].capitalize()}: {row['percentage']:.2f}%<br>"
+        for row in coverage_data
+    ]) + "</div>"
+
+    # Add to map HTML
+    with open(os.path.join(output_dir, f"segmentacion_mapa_{timestamp}.html"), "a") as f:
+        f.write(coverage_html)
+
 def main():
-    """
-    Process a satellite image to segment features using SAM and LangSAM, visualizing each as clear, toggleable layers.
-
-    This script:
-    1. Downloads a satellite image using TMS.
-    2. Uses LangSAM to create individual masks for specified text prompts (e.g., 'tree', 'water', 'building', 'road').
-    3. Performs automatic segmentation with SAMGeo.
-    4. Saves each segmentation (SAM and text-based) as GeoPackage and Shapefile layers.
-    5. Visualizes the results on an interactive Folium map with clear, toggleable layers, labels, and a legend.
-
-    Inputs:
-    - bbox: Bounding box coordinates [minx, miny, maxx, maxy]
-    - zoom: Zoom level for TMS download
-    - output_dir: Directory to save outputs
-    - checkpoint_dir: Directory containing SAM model checkpoint
-
-    Outputs:
-    - TIFF files for images and masks
-    - GeoPackage and Shapefile files for each segmentation layer
-    - HTML file for interactive map visualization with clear, toggleable layers
-    """
     setup_directories()
-    
-    # Step 1: Download TMS image
     image_path = download_tms_image(bbox, zoom)
-
-    # Step 2: Segment with LangSAM for text prompts (individual layers)
-    text_prompts = ["tree", "water", "building", "road"]  # Added building and road
+    text_prompts = ["tree", "water", "building", "road"]
     with rasterio.open(image_path) as src:
         profile = src.profile
     prompt_outputs = process_text_segmentation(text_prompts, image_path, profile)
-
-    # Step 3: Automatic SAM segmentation
     filtered_mask_path = run_sam_segmentation(image_path)
-
-    # Step 4: Save SAM segments as a layer
     sam_vector_out = save_sam_segments(filtered_mask_path)
-
-    # Step 5: Visualize with Folium (separate layers with enhanced clarity)
     print("🗺️ Mostrando mapa interactivo...")
     create_interactive_map(bbox, zoom, prompt_outputs, sam_vector_out)
+    calculate_class_coverage(prompt_outputs, sam_vector_out)
     print("✅ Proceso completado.")
 
 if __name__ == "__main__":
