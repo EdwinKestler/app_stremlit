@@ -9,15 +9,28 @@ from samgeo.text_sam import LangSAM
 import leafmap
 import torch
 from rasterio.features import shapes
+import folium
+import geopandas as gpd
+from folium import LayerControl
+from folium.features import GeoJson, GeoJsonTooltip
 
 # === CONFIGURACIÓN GENERAL ===
 bbox = [-90.015147, 14.916566, -90.010159, 14.919471]
 zoom = 19
-output_dir = "output"
-checkpoint_dir = "checkpoints"
+output_dir = os.path.abspath("output")
+checkpoint_dir = os.path.abspath("checkpoints")
+# Genera un timestamp para los archivos de salida
 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
 MIN_AREA = 10  # Minimum polygon area to be considered valid
+
+lang_checkpoint = os.path.join(checkpoint_dir, "mobile_sam.pt")
+if not os.path.isfile(lang_checkpoint):
+    print(f"❌ Checkpoint 'mobile_sam.pt' no se encontró en {lang_checkpoint}")
+    raise FileNotFoundError("mobile_sam.pt is required for LangSAM to work.")
+else:
+    print(f"✅ Checkpoint encontrado: {lang_checkpoint}")
+
 
 def setup_directories():
     os.makedirs(output_dir, exist_ok=True)
@@ -36,7 +49,6 @@ def download_tms_image(bbox, zoom):
         raise
 
 def process_text_segmentation(text_prompts, image_path, profile):
-    lang_checkpoint = os.path.join(checkpoint_dir, "mobile_sam.pt")
     if not os.path.exists(lang_checkpoint):
         print("⚠️ Checkpoint de LangSAM no encontrado. Por favor descargalo manualmente o implementa la función de descarga automática.")
     lang_sam = LangSAM()
@@ -129,53 +141,58 @@ def save_sam_segments(filtered_mask_path):
         print(f"❌ Error al guardar segmentos SAM: {e}")
         raise
 
-def create_interactive_map(bbox, zoom, prompt_outputs, sam_vector_out):
+
+
+def create_interactive_map_folium(bbox, prompt_outputs, sam_vector_out, output_html):
+    # Calcula centro
+    center_lat = (bbox[1] + bbox[3]) / 2
+    center_lon = (bbox[0] + bbox[2]) / 2
+
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=18, tiles='Esri.WorldImagery')
+
     layer_styles = {
-        "tree": {"color": "#00CC00", "weight": 2, "fillColor": "#00FF00", "fillOpacity": 0.2},
-        "water": {"color": "#3399FF", "weight": 2, "fillColor": "#66B2FF", "fillOpacity": 0.2},
-        "building": {"color": "#8B4513", "weight": 2, "fillColor": "#CD853F", "fillOpacity": 0.3},
-        "road": {"color": "#555555", "weight": 2, "fillColor": "#AAAAAA", "fillOpacity": 0.3},
-        "SAM_segment": {"color": "#FF6600", "weight": 2, "fillColor": "#FF9933", "fillOpacity": 0.2}
+        "tree": {"color": "#00CC00", "fillColor": "#00FF00"},
+        "water": {"color": "#3399FF", "fillColor": "#66B2FF"},
+        "building": {"color": "#8B4513", "fillColor": "#CD853F"},
+        "road": {"color": "#555555", "fillColor": "#AAAAAA"},
+        "SAM_segment": {"color": "#FF6600", "fillColor": "#FF9933"}
     }
 
-    center = [(bbox[1] + bbox[3]) / 2, (bbox[0] + bbox[2]) / 2]
-    adjusted_zoom = zoom - 1
-    html_path = os.path.join(output_dir, f"segmentacion_mapa_{timestamp}.html")
-    try:
-        m = leafmap.Map(center=center, zoom=adjusted_zoom, scroll_wheel_zoom=True)
-        m.add_basemap("Esri.WorldImagery")
-
-        for prompt, vector_out in prompt_outputs.items():
-            m.add_vector(
-                vector_out,
-                layer_name=f"{prompt.capitalize()} Segmentation",
-                style=layer_styles[prompt],
-                group="Text Segmentations"
-            )
-
-        m.add_vector(
-            sam_vector_out,
-            layer_name="SAM Segments",
-            style=layer_styles["SAM_segment"],
-            group="SAM Segmentations"
+    # Agrega capas LangSAM
+    for cls, vector_path in prompt_outputs.items():
+        gdf = gpd.read_file(vector_path).to_crs(epsg=4326)
+        style = layer_styles.get(cls, {"color": "#000", "fillColor": "#888"})
+        geojson = folium.GeoJson(
+            gdf,
+            name=f"{cls.capitalize()}",
+            style_function=lambda x, style=style: {
+                "color": style["color"],
+                "weight": 1,
+                "fillColor": style["fillColor"],
+                "fillOpacity": 0.4
+            },
+            tooltip=folium.GeoJsonTooltip(fields=["label"])
         )
+        geojson.add_to(m)
 
-        m.add_layer_control(position="topright")
-        legend_dict = {
-            "Trees (Green)": "#00FF00",
-            "Water (Blue)": "#66B2FF",
-            "Buildings (Brown)": "#CD853F",
-            "Roads (Gray)": "#AAAAAA",
-            "SAM Segments (Orange)": "#FF9933"
-        }
-        m.add_legend(title="Segmentation Layers", legend_dict=legend_dict, position="bottomright")
-        m.to_html(outfile=html_path)
+    # Agrega SAM segment
+    gdf_sam = gpd.read_file(sam_vector_out).to_crs(epsg=4326)
+    folium.GeoJson(
+        gdf_sam,
+        name="SAM_segment",
+        style_function=lambda x: {
+            "color": "#FF6600",
+            "weight": 1,
+            "fillColor": "#FF9933",
+            "fillOpacity": 0.2
+        },
+        tooltip=folium.GeoJsonTooltip(fields=["label"])
+    ).add_to(m)
 
-        print(f"📁 Mapa HTML exportado: {html_path}")
-        return m
-    except Exception as e:
-        print(f"❌ Error al crear el mapa interactivo: {e}")
-        raise
+    LayerControl(collapsed=False).add_to(m)
+    m.save(output_html)
+    print(f"🌍 Mapa Folium exportado a: {output_html}")
+
 
 def calculate_class_coverage(prompt_outputs, sam_vector_out):
     import pandas as pd
@@ -238,7 +255,8 @@ def main():
     filtered_mask_path = run_sam_segmentation(image_path)
     sam_vector_out = save_sam_segments(filtered_mask_path)
     print("🗺️ Mostrando mapa interactivo...")
-    create_interactive_map(bbox, zoom, prompt_outputs, sam_vector_out)
+    create_interactive_map_folium(bbox, prompt_outputs, sam_vector_out, os.path.join(output_dir, "folium_with_satellite_and_all_layers.html"))
+    print("📊 Calculando cobertura por clase...")
     calculate_class_coverage(prompt_outputs, sam_vector_out)
     print("✅ Proceso completado.")
 
