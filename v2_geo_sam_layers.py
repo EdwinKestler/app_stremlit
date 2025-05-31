@@ -20,7 +20,7 @@ output_dir = os.path.abspath("output")
 checkpoint_dir = os.path.abspath("checkpoints")
 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-MIN_AREA = 10  # Área mínima para considerar polígonos válidos
+MIN_AREA = 2  # Área mínima para considerar polígonos válidos
 
 lang_checkpoint = os.path.join(checkpoint_dir, "mobile_sam.pt")
 if not os.path.isfile(lang_checkpoint):
@@ -133,9 +133,9 @@ def create_interactive_map_folium(bbox, prompt_outputs, sam_vector_out, output_h
 
     layer_styles = {
         "tree": {"color": "#00CC00", "fillColor": "#00FF00"},
-        "water": {"color": "#3399FF", "fillColor": "#66B2FF"},
+        "river": {"color": "#3399FF", "fillColor": "#66B2FF"},
         "building": {"color": "#8B4513", "fillColor": "#CD853F"},
-        "road": {"color": "#555555", "fillColor": "#AAAAAA"},
+        "bridge": {"color": "#555555", "fillColor": "#AAAAAA"},
         "SAM_segment": {"color": "#FF6600", "fillColor": "#FF9933"}
     }
 
@@ -182,7 +182,7 @@ def create_interactive_map_folium(bbox, prompt_outputs, sam_vector_out, output_h
 
     # Genera HTML de la tabla de porcentajes
     rows = ""
-    for cls in ["tree", "water", "building", "road"]:
+    for cls in ["tree", "river", "building", "bridge"]:
         pct = (class_areas.get(cls, 0) / total_area * 100) if total_area > 0 else 0.0
         color = layer_styles[cls]["fillColor"]
         rows += f"<tr><td style='padding:4px 8px;'><span style='display:inline-block;width:16px;height:16px;background:{color};margin-right:8px;border-radius:3px;'></span>{cls.capitalize()}</td><td style='padding:4px 8px;text-align:right;font-weight:bold;'>{pct:.2f}%</td></tr>"
@@ -227,11 +227,13 @@ def calculate_class_coverage(prompt_outputs, sam_vector_out):
     csv_path = os.path.join(output_dir, f"coverage_summary_{timestamp}.csv")
     df.to_csv(csv_path, index=False)
     print(f"📄 Cobertura exportada a CSV: {csv_path}")
+    
+    
 
 def main():
     setup_directories()
     image_path = download_tms_image(bbox, zoom)
-    text_prompts = ["tree", "water", "building", "road"]
+    text_prompts = ["tree", "river", "building", "bridge"]
     with rasterio.open(image_path) as src:
         profile = src.profile
     prompt_outputs = process_text_segmentation(text_prompts, image_path, profile)

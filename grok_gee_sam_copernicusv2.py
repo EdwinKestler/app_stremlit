@@ -16,7 +16,7 @@ from getpass import getpass
 import numpy as np
 import rasterio
 import geopandas as gpd
-from shapely.geometry import box, shape
+from shapely.geometry import box
 from samgeo import SamGeo, tms_to_geotiff
 from samgeo.text_sam import LangSAM
 import folium
@@ -39,24 +39,24 @@ CONFIG = {
     'data_dir': 'data',
     'output_dir': 'output',
     'checkpoint_dir': 'checkpoints',
-    'min_area': 2,  # Increased to filter noise
+    'min_area': 2,
     'bbox': [-90.015147, 14.916566, -90.010159, 14.919471],
     'zoom': 19,
     'prompt_thresholds': {
-        'tree': {'box_threshold': 0.2, 'text_threshold': 0.2},  # Lowered thresholds
-        'river': {'box_threshold': 0.2, 'text_threshold': 0.2},
-        'building': {'box_threshold': 0.25, 'text_threshold': 0.22},
-        'bridge': {'box_threshold': 0.2, 'text_threshold': 0.18}
+        'tree': {'box_threshold': 0.3, 'text_threshold': 0.24},
+        'water': {'box_threshold': 0.24, 'text_threshold': 0.24},
+        'building': {'box_threshold': 0.28, 'text_threshold': 0.25},
+        'road': {'box_threshold': 0.24, 'text_threshold': 0.2}
     },
     'gee_export': {
         's2_date_range': (
             (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d'),
             datetime.now().strftime('%Y-%m-%d')
         ),
-        's2_cloud_percentage': 50,  # Increased
+        's2_cloud_percentage': 50,
         'dem_scale': 30,
-        'lc_scale': 50,  # Finer scale
-        'precip_scale': 500  # Finer scale
+        'lc_scale': 50,
+        'precip_scale': 500
     }
 }
 
@@ -136,46 +136,34 @@ def get_cdse_access_token(username: str, password: str, client_id: str = "cdse-p
 
 def get_latest_sentinel2_date(bbox: list, access_token: str, max_cloud_cover: int = 50) -> Optional[str]:
     """Query the CDSE Catalog API for the latest Sentinel-2 date."""
-    # Try new field name
-    cloud_filters = [
-        f"Attributes/any(a: a/Name eq 'CloudCover' and a/OData.CSC.DoubleAttribute/Value le {max_cloud_cover}) and ",
-        ""  # No cloud filter
-    ]
-    for cloud_filter in cloud_filters:
+    cloud_limits = [max_cloud_cover, 80, 100]
+    for cloud_limit in cloud_limits:
         try:
             end_date = datetime.now().strftime('%Y-%m-%d')
             start_date = (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d')
             url = (
-                "https://catalogue.dataspace.copernicus.eu/odata/v1/Products?$filter=Collection/Name eq 'SENTINEL-2' and "
-                f"{cloud_filter}"
-                f"OData.CSC.Intersects(area=geography'SRID=4326;POLYGON(({bbox[0]} {bbox[1]}, {bbox[2]} {bbox[1]}, {bbox[2]} {bbox[3]}, {bbox[0]} {bbox[3]}, {bbox[0]} {bbox[1]}))') and "
-                f"ContentDate/Start ge {start_date}T00:00:00.000Z and ContentDate/End le {end_date}T23:59:59.999Z"
-                "&$orderby=ContentDate/Start desc&$top=1"
+                "https://catalogue.dataspace.copernicus.eu/resto/api/collections/Sentinel2/search.json?"
+                f"box={bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}"
+                f"&startDate={start_date}T00:00:00Z"
+                f"&completionDate={end_date}T23:59:59Z"
+                f"&cloudCover=[0,{cloud_limit}]"
+                "&sortParam=startDate&sortOrder=descending&maxRecords=1"
             )
             headers = {"Authorization": f"Bearer {access_token}"}
             response = requests.get(url, headers=headers, timeout=10)
             response.raise_for_status()
             data = response.json()
-            if not data.get('value'):
-                logger.warning("No Sentinel-2 data found.")
+            if not data.get('features'):
+                logger.warning(f"No Sentinel-2 data found with cloud cover <= {cloud_limit}%.")
                 continue
-            latest_date = data['value'][0]['ContentDate']['Start'].split('T')[0]
-            logger.info(f"Latest Sentinel-2 date found: {latest_date}")
+            latest_date = data['features'][0]['properties']['startDate'].split('T')[0]
+            logger.info(f"Latest Sentinel-2 date found with cloud cover <= {cloud_limit}%: {latest_date}")
             return latest_date
         except requests.HTTPError as e:
             logger.error(f"HTTP error querying CDSE Catalog API: {e.response.status_code} {e.response.text}")
-            if e.response.status_code == 400:
-                logger.warning("CloudCover field likely invalid—retrying without cloud filter.")
-                continue
-            if e.response.status_code == 403:
-                logger.warning("403 Forbidden: Clearing cached token and retrying authentication.")
-                token_file = os.path.join(CONFIG['output_dir'], 'cdse_token.json')
-                if os.path.exists(token_file):
-                    os.remove(token_file)
-                return None
         except requests.RequestException as e:
-            logger.error(f"Error querying CDSE Catalog API: {e}")
-    logger.warning("No Sentinel-2 data found after all cloud filter attempts.")
+            logger.error(f"Error querying CDSE Catalog API with cloud cover {cloud_limit}%: {e}")
+    logger.warning("No Sentinel-2 data found after trying all cloud cover limits.")
     return None
 
 def get_latest_sentinel2_date_fallback(bbox: list, max_cloud_cover: int = 50) -> Optional[str]:
@@ -308,15 +296,6 @@ def export_sentinel2(bbox: list, timestamp: str, config: dict) -> str:
             else:
                 latest_date = get_latest_sentinel2_date(bbox, token_data["access_token"],
                                                        config['gee_export']['s2_cloud_percentage'])
-                if not latest_date:
-                    logger.warning("CDSE Catalog query failed. Retrying with new token.")
-                    token_file = os.path.join(CONFIG['output_dir'], 'cdse_token.json')
-                    if os.path.exists(token_file):
-                        os.remove(token_file)
-                    token_data = get_cdse_access_token(username, password, totp=totp)
-                    if token_data:
-                        latest_date = get_latest_sentinel2_date(bbox, token_data["access_token"],
-                                                               config['gee_export']['s2_cloud_percentage'])
 
             if not latest_date:
                 logger.warning("No valid Sentinel-2 date found. Using fallback date range.")
@@ -485,35 +464,30 @@ def enhance_segmentation_with_slope(image_path: str, slope_path: str) -> str:
         logger.error(f"Error enhancing image with slope: {e}")
         return image_path
 
-def get_valid_base_image(bbox: list, timestamp: str, config: dict) -> tuple[str, Optional[str]]:
-    """Generate Esri TMS image for segmentation and optionally Sentinel-2 for map layers."""
-    # Always generate Esri TMS image for segmentation
+def get_valid_base_image(bbox: list, timestamp: str, config: dict) -> str:
+    """Get a valid base image (Sentinel-2 or Esri TMS fallback) in uint8 format."""
+    logger.info("Searching for cloud-free Sentinel-2 image...")
+    s2_path = export_sentinel2(bbox, timestamp, config)
+    if s2_path and is_valid_file(s2_path):
+        with rasterio.open(s2_path) as src:
+            if src.dtypes[0] != 'uint8':
+                return convert_tiff_to_uint8(s2_path)
+        return s2_path
+
+    logger.warning("Falling back to Esri World Imagery TMS.")
     tms_path = os.path.join(config['data_dir'], f"esri_image_{timestamp}.tif")
     try:
         tms_to_geotiff(output=tms_path, bbox=bbox, zoom=config['zoom'], source="Satellite", overwrite=True)
         if is_valid_file(tms_path):
             with rasterio.open(tms_path) as src:
                 if src.dtypes[0] != 'uint8':
-                    tms_path = convert_tiff_to_uint8(tms_path)
+                    return convert_tiff_to_uint8(tms_path)
             logger.info(f"TMS base image created: {tms_path}")
-        else:
-            logger.error("Failed to generate valid Esri TMS image.")
-            return None, None
+            return tms_path
     except Exception as e:
         logger.error(f"Error generating TMS: {e}")
-        return None, None
-
-    # Optionally generate Sentinel-2 image for map layers
-    s2_path = export_sentinel2(bbox, timestamp, config)
-    if s2_path and is_valid_file(s2_path):
-        with rasterio.open(s2_path) as src:
-            if src.dtypes[0] != 'uint8':
-                s2_path = convert_tiff_to_uint8(s2_path)
-        logger.info(f"Sentinel-2 image created: {s2_path}")
-    else:
-        s2_path = None
-
-    return tms_path, s2_path
+    logger.error("No valid base image obtained. Aborting.")
+    return None
 
 # === Segmentation ===
 def process_text_segmentation(text_prompts: list, image_path: str, config: dict) -> dict:
@@ -534,7 +508,6 @@ def process_text_segmentation(text_prompts: list, image_path: str, config: dict)
                 mask_path = os.path.join(tmp_dir, f"mask_{prompt}.tif")
                 lang_sam.show_anns(cmap="Greens", add_boxes=True, alpha=1, blend=False, output=mask_path)
                 if not is_valid_file(mask_path):
-                    logger.warning(f"No valid mask generated for {prompt}")
                     continue
                 with rasterio.open(mask_path) as src:
                     mask = src.read(1)
@@ -547,9 +520,6 @@ def process_text_segmentation(text_prompts: list, image_path: str, config: dict)
                         continue
                     geoms.append(polygon)
                     props.append({"type": prompt, "label": f"{prompt.capitalize()} Feature"})
-                if not geoms:
-                    logger.warning(f"No valid polygons for {prompt}")
-                    continue
                 vector_out = os.path.join(config['output_dir'], f"segment_{prompt}_{timestamp}.gpkg")
                 gdf = gpd.GeoDataFrame(props, geometry=geoms, crs=crs)
                 gdf.to_file(vector_out, driver="GPKG")
@@ -568,9 +538,8 @@ def run_sam_segmentation(image_path: str, config: dict) -> str:
     sam = SamGeo(model_type="vit_h", checkpoint=checkpoint_path, device=device)
     mask_path = os.path.join(config['output_dir'], f"sam_mask_{timestamp}.tif")
     try:
-        sam.generate(source=image_path, output=mask_path, batch=False, foreground=True)
+        sam.generate(source=image_path, output=mask_path, batch=True, foreground=True)
         if not is_valid_file(mask_path):
-            logger.warning("No valid SAM mask generated")
             return None
         with rasterio.open(mask_path) as src:
             mask_data = src.read(1)
@@ -583,9 +552,6 @@ def run_sam_segmentation(image_path: str, config: dict) -> str:
                 continue
             geoms.append(polygon)
             props.append({"type": "SAM_segment", "label": "SAM Segment"})
-        if not geoms:
-            logger.warning("No valid SAM polygons generated")
-            return None
         vector_out = os.path.join(config['output_dir'], f"sam_segment_{timestamp}.gpkg")
         gdf = gpd.GeoDataFrame(props, geometry=geoms, crs=crs)
         gdf.to_file(vector_out, driver="GPKG")
@@ -596,10 +562,10 @@ def run_sam_segmentation(image_path: str, config: dict) -> str:
         return None
 
 # === Metrics and Mapping ===
-def calculate_segmentation_urbanization(building_vector: str, bridge_vector: str, total_area: float) -> float:
-    """Calculate urbanization percentage based on building and bridge areas."""
+def calculate_segmentation_urbanization(building_vector: str, road_vector: str, total_area: float) -> float:
+    """Calculate urbanization percentage based on building and road areas."""
     area_urban = 0.0
-    for vector in [building_vector, bridge_vector]:
+    for vector in [building_vector, road_vector]:
         if is_valid_file(vector):
             try:
                 gdf = gpd.read_file(vector)
@@ -608,20 +574,16 @@ def calculate_segmentation_urbanization(building_vector: str, bridge_vector: str
                 logger.error(f"Error reading {vector} for urbanization: {e}")
     return round((area_urban / total_area) * 100, 2) if total_area > 0 else 0.0
 
-def calculate_vegetation_precipitation(tree_vector: str, river_vector: str, precip_path: str, total_area: float) -> tuple:
-    """Calculate vegetation, river percentages, and average precipitation."""
-    veg_percentage = river_percentage = avg_precip = 0
-    for vector, name in [(tree_vector, 'tree'), (river_vector, 'river')]:
-        if is_valid_file(vector):
-            try:
-                gdf = gpd.read_file(vector)
-                area = gdf.geometry.area.sum()
-                if name == 'tree':
-                    veg_percentage = round((area / total_area) * 100, 2)
-                else:
-                    river_percentage = round((area / total_area) * 100, 2)
-            except Exception as e:
-                logger.error(f"Error reading {vector} for {name}: {e}")
+def calculate_vegetation_precipitation(tree_vector: str, precip_path: str, total_area: float) -> tuple:
+    """Calculate vegetation percentage and average precipitation."""
+    veg_percentage = avg_precip = 0
+    if is_valid_file(tree_vector):
+        try:
+            gdf = gpd.read_file(tree_vector)
+            veg_area = gdf.geometry.area.sum()
+            veg_percentage = round((veg_area / total_area) * 100, 2)
+        except Exception as e:
+            logger.error(f"Error reading {tree_vector} for vegetation: {e}")
     if is_valid_file(precip_path):
         try:
             with rasterio.open(precip_path) as src:
@@ -632,7 +594,7 @@ def calculate_vegetation_precipitation(tree_vector: str, river_vector: str, prec
             logger.error(f"Error reading {precip_path} for precipitation: {e}")
     else:
         logger.warning("Precipitation data unavailable; setting average precipitation to 0 mm.")
-    return veg_percentage, river_percentage, avg_precip
+    return veg_percentage, avg_precip
 
 def initialize_map(bbox: list, zoom: int) -> folium.Map:
     """Initialize a Folium map with Esri satellite tiles."""
@@ -696,15 +658,14 @@ def add_segmentation_layers(m: folium.Map, prompt_outputs: dict, sam_vector_out:
 def add_metrics_panel(m: folium.Map, prompt_outputs: dict, precip_path: str, total_area: float) -> None:
     """Add an HTML panel with environmental metrics to the map."""
     seg_urban = calculate_segmentation_urbanization(
-        prompt_outputs.get("building"), prompt_outputs.get("bridge"), total_area)
-    veg_percentage, river_percentage, avg_precip = calculate_vegetation_precipitation(
-        prompt_outputs.get("tree"), prompt_outputs.get("river"), precip_path, total_area)
+        prompt_outputs.get("building"), prompt_outputs.get("road"), total_area)
+    veg_percentage, avg_precip = calculate_vegetation_precipitation(
+        prompt_outputs.get("tree"), precip_path, total_area)
     metrics_html = f"""
     <div style="position: fixed; bottom: 40px; left: 40px; width: 240px; background-color: white; border: 2px solid #00A878; border-radius: 8px; padding: 12px; font-family: 'Inter', sans-serif; font-size: 14px; box-shadow: 2px 2px 8px rgba(0,0,0,0.2); z-index: 9999;">
       <b>Environmental Metrics</b><br>
       Urban (Seg): <span style="color:#00A878; font-weight:bold;">{seg_urban}%</span><br>
       Vegetation: <span style="color:#00A878; font-weight:bold;">{veg_percentage}%</span><br>
-      River: <span style="color:#00A878; font-weight:bold;">{river_percentage}%</span><br>
       Avg Precipitation: <span style="color:#00A878; font-weight:bold;">{avg_precip} mm</span><br>
     </div>
     """
@@ -714,9 +675,9 @@ def create_interactive_map(bbox: list, zoom: int, prompt_outputs: dict, sam_vect
     """Create and save an interactive Folium map with GEE and segmentation layers."""
     layer_styles = {
         "tree": {"color": "#00CC00", "weight": 2, "fillColor": "#00FF00", "fillOpacity": 0.2},
-        "river": {"color": "#3399FF", "weight": 2, "fillColor": "#66B2FF", "fillOpacity": 0.2},
+        "water": {"color": "#3399FF", "weight": 2, "fillColor": "#66B2FF", "fillOpacity": 0.2},
         "building": {"color": "#800080", "weight": 2, "fillColor": "#CC00CC", "fillOpacity": 0.2},
-        "bridge": {"color": "#808080", "weight": 2, "fillColor": "#A9A9A9", "fillOpacity": 0.2},
+        "road": {"color": "#808080", "weight": 2, "fillColor": "#A9A9A9", "fillOpacity": 0.2},
         "SAM_segment": {"color": "#FF6600", "weight": 2, "fillColor": "#FF9933", "fillOpacity": 0.2}
     }
     # Calculate total area in square meters
@@ -768,18 +729,17 @@ def main():
     authenticate_gee(config['key_path'], config['project_id'])
 
     dem_path, slope_path, cgls_path, precip_path = export_gee_layers(config['bbox'], timestamp, config)
-    tms_path, s2_path = get_valid_base_image(config['bbox'], timestamp, config)
-    if not tms_path:
+    base_image_path = get_valid_base_image(config['bbox'], timestamp, config)
+    if not base_image_path:
         logger.error("No valid base image obtained. Aborting.")
         return
 
-    enhanced_image_path = enhance_segmentation_with_slope(tms_path, slope_path)
-    text_prompts = ["tree", "river", "building", "bridge"]
+    enhanced_image_path = enhance_segmentation_with_slope(base_image_path, slope_path)
+    text_prompts = ["tree", "water", "building", "road"]
     prompt_outputs = process_text_segmentation(text_prompts, enhanced_image_path, config)
     sam_vector_out = run_sam_segmentation(enhanced_image_path, config)
     gee_layers = [
-        {"name": "Sentinel-2 Image", "path": s2_path, "bands": [1, 2, 3], "opacity": 0.75} if is_valid_file(s2_path) else None,
-        {"name": "Esri TMS Image", "path": tms_path, "bands": [1, 2, 3], "opacity": 0.75} if is_valid_file(tms_path) else None,
+        {"name": "Base Image", "path": base_image_path, "bands": [1, 2, 3], "opacity": 0.75} if is_valid_file(base_image_path) else None,
         {"name": "DEM Copernicus", "path": dem_path, "bands": [1], "opacity": 0.5} if is_valid_file(dem_path) else None,
         {"name": "Slope Copernicus", "path": slope_path, "bands": [1], "opacity": 0.5} if is_valid_file(slope_path) else None,
         {"name": "CGLS-LC100", "path": cgls_path, "bands": [1], "opacity": 0.4} if is_valid_file(cgls_path) else None,

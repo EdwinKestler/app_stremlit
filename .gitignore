@@ -4,7 +4,10 @@ checkpoints/
 data/
 *.pth
 *.tif
+*.pt
 EsriCache/
 output/
 .venv/
 .conda/
+gee_auth/
+.env
