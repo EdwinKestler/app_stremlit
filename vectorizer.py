@@ -42,9 +42,36 @@ def raster_to_vector(raster_path: str, out_path: str) -> gpd.GeoDataFrame:
     return gdf
 
 
-def summarise(gdf: gpd.GeoDataFrame, out_csv: str) -> pd.DataFrame:
-    """Create a summary CSV of polygon areas in square metres."""
+def summarise(
+    gdf: gpd.GeoDataFrame, out_csv: str, class_col: str = "segment_class"
+) -> pd.DataFrame:
+    """Summarise total area and percentage coverage by segment class.
+
+    Parameters
+    ----------
+    gdf : geopandas.GeoDataFrame
+        GeoDataFrame containing polygons and a column specifying the
+        segment class for each polygon.
+    out_csv : str
+        Destination path for the summary CSV.
+    class_col : str, optional
+        Name of the column in ``gdf`` storing the segment class labels,
+        by default "segment_class".
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame with columns ``segment_class``, ``area_m2`` and
+        ``coverage_pct``.
+    """
+
+    if class_col not in gdf.columns:
+        raise ValueError(f"Missing '{class_col}' column in GeoDataFrame")
+
     summary = gdf.copy()
     summary["area_m2"] = summary.geometry.area
-    summary[["area_m2"]].to_csv(out_csv, index=False)
-    return summary
+    grouped = summary.groupby(class_col, as_index=False)["area_m2"].sum()
+    total_area = grouped["area_m2"].sum()
+    grouped["coverage_pct"] = (grouped["area_m2"] / total_area) * 100
+    grouped.to_csv(out_csv, index=False)
+    return grouped
